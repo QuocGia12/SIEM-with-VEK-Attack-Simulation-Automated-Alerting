@@ -24,7 +24,7 @@ Architecture: the lab uses 3 servers:
 * Logging Server: runs Elasticsearch and Kibana
 * Attacker: performs simulated attacks against the target (SSH brute force and SQL Injection)
 
-![System Architecture](assets/architecture.png)
+![System Architecture](assets/Architecture.png)
 
 ## 3. Target Server
 
