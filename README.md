@@ -119,7 +119,7 @@ Then, for each `<target>` log source, create a Vector config file `<target>.yaml
 
 ### b. Configuration of Vector agents
 
-The details of the `.yaml` configuration files for the Vector agents are located in [Config Vector](Config Vector/)
+The details of the `.yaml` configuration files for the Vector agents are located in [Config Vector](Config%20Vector/)
 
 ## 5. Detection rules
 
