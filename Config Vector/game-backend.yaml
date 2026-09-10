@@ -1,0 +1,213 @@
+sources:
+  docker_logs:
+    type: docker_logs
+    include_containers:
+      - api-server-zodiac-game
+
+
+transforms:
+
+  # =========================================================
+  # 1. Enrich Docker logs
+  # =========================================================
+  backend_enrich:
+    type: remap
+    inputs:
+      - docker_logs
+    source: |
+      .service.name = "game-backend"
+      .message = to_string!(.message)
+
+
+      # Remove Docker labels
+      del(.label)
+
+  # =========================================================
+  # 2. Parse JSON logs
+  # =========================================================
+  backend_parse_json:
+    type: remap
+    inputs:
+      - backend_enrich
+    source: |
+
+      parsed, err = parse_json(.message)
+
+      if err == null && is_object(parsed) {
+        . = merge!(., parsed)
+      }
+
+
+  # =========================================================
+  # 3. Classify logs
+  # =========================================================
+  backend_classify:
+    type: remap
+    inputs:
+      - backend_parse_json
+    source: |
+
+      # Prisma
+      if exists(."db.system") &&
+         exists(."db.operation") {
+
+        .log_type = "prisma"
+
+      # HTTP request/response
+      } else if exists(."http.request.method") &&
+                exists(."http.response.status_code") {
+
+        .log_type = "backend_http"
+
+      # Node.js application/startup log
+      } else {
+
+        .log_type = "nodejs"
+      }
+
+
+  # =========================================================
+  # 4. Route
+  # =========================================================
+  backend_route:
+    type: route
+    inputs:
+      - backend_classify
+
+    route:
+      nodejs: '.log_type == "nodejs"'
+      backend_http: '.log_type == "backend_http"'
+      prisma: '.log_type == "prisma"'
+
+
+  # =========================================================
+  # 5. Node.js logs
+  # =========================================================
+  nodejs_format:
+    type: remap
+    inputs:
+      - backend_route.nodejs
+    source: |
+
+      .message = to_string!(.message)
+
+      del(.log_type)
+
+      del(.container_created_at)
+      del(.container_id)
+      del(.container_name)
+      del(.source_type)
+      del(.stream)
+      del(.service)
+
+
+  # =========================================================
+  # 6. Backend HTTP logs
+  # =========================================================
+  backend_http_format:
+    type: remap
+    inputs:
+      - backend_route.backend_http
+    source: |
+
+      del(.log_type)
+
+      del(.container_created_at)
+      del(.container_id)
+      del(.container_name)
+      del(.source_type)
+      del(.stream)
+
+
+  # =========================================================
+  # 7. Prisma logs
+  # =========================================================
+  prisma_format:
+    type: remap
+    inputs:
+      - backend_route.prisma
+    source: |
+
+      del(.log_type)
+      del(.container_created_at)
+      del(.container_id)
+      del(.container_name)
+      del(.source_type)
+      del(.stream)
+
+
+sinks:
+
+  # =========================================================
+  # Node.js application
+  # =========================================================
+  nodejs_elasticsearch:
+    type: elasticsearch
+    inputs:
+      - nodejs_format
+
+    endpoints:
+      - "${ELASTICSEARCH_HTTPS_ENDPOINT}"
+
+    auth:
+      strategy: basic
+      user: "${ELASTICSEARCH_USERNAME}"
+      password: "${ELASTICSEARCH_PASSWORD}"
+
+    tls:
+      ca_file: "${ELASTICSEARCH_CA_CERT}"
+
+    bulk:
+      index: "game-backend-nodejs-%Y-%m-%d"
+
+    mode: "bulk"
+
+
+  # =========================================================
+  # Backend HTTP
+  # =========================================================
+  backend_http_elasticsearch:
+    type: elasticsearch
+    inputs:
+      - backend_http_format
+
+    endpoints:
+      - "${ELASTICSEARCH_HTTPS_ENDPOINT}"
+
+    auth:
+      strategy: basic
+      user: "${ELASTICSEARCH_USERNAME}"
+      password: "${ELASTICSEARCH_PASSWORD}"
+
+    tls:
+      ca_file: "${ELASTICSEARCH_CA_CERT}"
+
+    bulk:
+      index: "game-backend-app-%Y-%m-%d"
+
+    mode: "bulk"
+
+
+  # =========================================================
+  # Prisma
+  # =========================================================
+  prisma_elasticsearch:
+    type: elasticsearch
+    inputs:
+      - prisma_format
+
+    endpoints:
+      - "${ELASTICSEARCH_HTTPS_ENDPOINT}"
+
+    auth:
+      strategy: basic
+      user: "${ELASTICSEARCH_USERNAME}"
+      password: "${ELASTICSEARCH_PASSWORD}"
+
+    tls:
+      ca_file: "${ELASTICSEARCH_CA_CERT}"
+
+    bulk:
+      index: "game-backend-prisma-%Y-%m-%d"
+
+    mode: "bulk"

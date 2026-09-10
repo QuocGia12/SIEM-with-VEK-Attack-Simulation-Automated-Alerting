@@ -1,0 +1,73 @@
+sources:
+  ssh_journal:
+    type: journald
+    include_units:
+      - ssh.service
+
+transforms:
+  ssh_auth_filter:
+    type: remap
+    inputs:
+      - ssh_journal
+    source: |
+      # Get the original journal message
+      message = to_string!(.message)
+
+      # Only keep successful and failed password authentication events
+      if !match(message, r'\bAccepted password for ') &&
+         !match(message, r'\bFailed password for ') {
+        abort
+      }
+
+      # Parse successful login
+      if match(message, r'Accepted password for ') {
+        parsed = parse_regex!(
+          message,
+          r'Accepted password for (?P<user>\S+) from (?P<src_ip>\S+) port (?P<src_port>\d+) ssh2'
+        )
+
+        .event.action = "ssh_login"
+        .event.outcome = "success"
+        .user.name = parsed.user
+        .source.ip = parsed.src_ip
+        .source.port = to_int!(parsed.src_port)
+
+      # Parse failed login
+      } else if match(message, r'Failed password for ') {
+        parsed = parse_regex!(
+          message,
+          r'Failed password for (?:invalid user )?(?P<user>\S+) from (?P<src_ip>\S+) port (?P<src_port>\d+) ssh2'
+        )
+
+        .event.action = "ssh_login"
+        .event.outcome = "failure"
+        .user.name = parsed.user
+        .source.ip = parsed.src_ip
+        .source.port = to_int!(parsed.src_port)
+      }
+
+      .service.name = "ssh"
+      .log.source = "systemd-journal"
+
+
+
+sinks:
+  elasticsearch:
+    type: elasticsearch
+    inputs:
+      - ssh_auth_filter
+    endpoints:
+      - "${ELASTICSEARCH_HTTPS_ENDPOINT}"
+
+    auth:
+      strategy: basic
+      user: "${ELASTICSEARCH_USERNAME}"
+      password: "${ELASTICSEARCH_PASSWORD}"
+
+    tls:
+      ca_file: "${ELASTICSEARCH_CA_CERT}"
+
+    mode: bulk
+
+    bulk:
+      index: "ssh-login-%Y-%m-%d"

@@ -1,0 +1,249 @@
+sources:
+  docker_logs:
+    type: docker_logs
+    include_containers:
+      - frontend-zodiac-game
+
+
+transforms:
+
+  # Add environment/container metadata if needed
+  fe_enrich_env:
+    type: remap
+    inputs:
+      - docker_logs
+    source: |
+      .service.name = "game-frontend"
+
+      del(.label)
+
+  # Parse Nginx access/error logs
+  fe_parse_nginx:
+    type: remap
+    inputs:
+      - fe_enrich_env
+    source: |
+      msg = to_string!(.message)
+
+      # ==================================================
+      # 1. Nginx ACCESS LOG
+      #
+      # Example:
+      # 172.18.0.1 - - [09/Sep/2026:01:23:45 +0000] "GET / HTTP/1.1" 200 123 "-" "Mozilla/5.0"
+      # ==================================================
+      access_match, access_err = parse_regex(
+        msg,
+        r'^(?P<remote_addr>\S+)\s+\S+\s+\S+\s+\[(?P<time>[^\]]+)\]\s+"(?P<method>\S+)\s+(?P<path>\S+)(?:\s+(?P<protocol>[^"]+))?"\s+(?P<status>\d{3})\s+(?P<body_bytes>\d+)\s+"(?P<referrer>[^"]*)"\s+"(?P<ua>[^"]*)"'
+      )
+
+      if access_err == null {
+
+        .timestamp = parse_timestamp!(
+          access_match.time,
+          format: "%d/%b/%Y:%H:%M:%S %z"
+        )
+
+        .event = {
+          "dataset": "nginx.access"
+        }
+
+        .client = {
+          "ip": access_match.remote_addr
+        }
+
+        .http = {
+          "request": {
+            "method": access_match.method,
+            "referrer": access_match.referrer
+          },
+          "response": {
+            "status_code": to_int!(access_match.status),
+            "body": {
+              "bytes": to_int!(access_match.body_bytes)
+            }
+          }
+        }
+
+        .url = {
+          "path": access_match.path
+        }
+
+        .network = {
+          "protocol": access_match.protocol
+        }
+
+        .user_agent = {
+          "original": access_match.ua
+        }
+
+        .log_type = "nginx_access"
+
+      } else {
+
+        # ==================================================
+        # 2. Nginx ERROR LOG
+        #
+        # Example:
+        # 2026/09/09 01:23:45 [error] 29#29: *1 connect() failed ...
+        # ==================================================
+        error_match, error_err = parse_regex(
+          msg,
+          r'^(?P<ts>\d{4}/\d{2}/\d{2}\s+\d{2}:\d{2}:\d{2})\s+\[(?P<lvl>[a-z]+)\]\s+(?P<pid>\d+)#(?P<tid>\d+):\s*(?P<err>.*)$'
+        )
+
+        if error_err == null {
+
+          .timestamp = parse_timestamp!(
+            error_match.ts,
+            format: "%Y/%m/%d %H:%M:%S"
+          )
+
+          .event = {
+            "dataset": "nginx.error"
+          }
+
+          .log = {
+            "level": error_match.lvl
+          }
+
+          .process = {
+            "pid": to_int!(error_match.pid)
+          }
+
+          .thread = {
+            "id": to_int!(error_match.tid)
+          }
+
+          .message = error_match.err
+
+          .log_type = "nginx_error"
+
+        } else {
+
+          # ==================================================
+          # 3. Nginx ENTRYPOINT / Docker startup logs
+          #
+          # These are NOT access/error logs.
+          # Treat them as nexjs logs.
+          # ==================================================
+          .log_type = "nextjs"
+
+        }
+      }
+
+
+  # ------------------------------------------------------
+  # Nextjs logs
+  # Keep ONLY message
+  # ------------------------------------------------------
+  fe_parse_nextjs:
+    type: remap
+    inputs:
+      - fe_parse_nginx
+    source: |
+      if .log_type != "nextjs" {
+        abort
+      }
+
+      msg = to_string!(.message)
+
+      . = {
+        "message": msg
+      }
+
+
+  # ------------------------------------------------------
+  # Nginx access logs
+  # ------------------------------------------------------
+  fe_nginx_access:
+    type: remap
+    inputs:
+      - fe_parse_nginx
+    source: |
+      if .log_type != "nginx_access" {
+        abort
+      }
+
+
+  # ------------------------------------------------------
+  # Nginx error logs
+  # ------------------------------------------------------
+  fe_nginx_error:
+    type: remap
+    inputs:
+      - fe_parse_nginx
+    source: |
+      if .log_type != "nginx_error" {
+        abort
+      }
+
+
+sinks:
+
+  # ======================================================
+  # Nginx ACCESS
+  # ======================================================
+  elasticsearch_access:
+    type: elasticsearch
+    inputs:
+      - fe_nginx_access
+
+    endpoints:
+      - "${ELASTICSEARCH_HTTPS_ENDPOINT}"
+
+    auth:
+      strategy: basic
+      user: "${ELASTICSEARCH_USERNAME}"
+      password: "${ELASTICSEARCH_PASSWORD}"
+
+    tls:
+      ca_file: "${ELASTICSEARCH_CA_CERT}"
+
+    bulk:
+      index: "game-frontend-access-%Y-%m-%d"
+
+
+  # ======================================================
+  # Nginx ERROR
+  # ======================================================
+  elasticsearch_error:
+    type: elasticsearch
+    inputs:
+      - fe_nginx_error
+
+    endpoints:
+      - "${ELASTICSEARCH_HTTPS_ENDPOINT}"
+
+    auth:
+      strategy: basic
+      user: "${ELASTICSEARCH_USERNAME}"
+      password: "${ELASTICSEARCH_PASSWORD}"
+
+    tls:
+      ca_file: "${ELASTICSEARCH_CA_CERT}"
+
+    bulk:
+      index: "game-frontend-error-%Y-%m-%d"
+
+
+  # ======================================================
+  # Nextjs
+  # ======================================================
+  elasticsearch_nextjs:
+    type: elasticsearch
+    inputs:
+      - fe_parse_nextjs
+
+    endpoints:
+      - "${ELASTICSEARCH_HTTPS_ENDPOINT}"
+
+    auth:
+      strategy: basic
+      user: "${ELASTICSEARCH_USERNAME}"
+      password: "${ELASTICSEARCH_PASSWORD}"
+
+    tls:
+      ca_file: "${ELASTICSEARCH_CA_CERT}"
+
+    bulk:
+      index: "game-frontend-nextjs-%Y-%m-%d"
